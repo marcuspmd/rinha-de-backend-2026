@@ -5,3 +5,10 @@ resources/references.json
 test/results.json
 temporary-results
 misc/participant-removal.sh
+index.bin
+my-solution/index.bin
+target/
+**/target/
+test/results-local.json
+.antigravitycli/
+

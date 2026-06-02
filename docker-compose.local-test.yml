@@ -1,0 +1,96 @@
+services:
+  haproxy:
+    image: haproxy:2.8-alpine
+    container_name: haproxy
+    volumes:
+      - ./my-solution/haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - sock-dir:/run/sock
+    ports:
+      - "9999:9999"
+    depends_on:
+      - api1
+      - api2
+    deploy:
+      resources:
+        limits:
+          cpus: "0.10"
+          memory: "30MB"
+    networks:
+      - rinha-net
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9999/ready"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 60s
+
+  api1:
+    build:
+      context: .
+      dockerfile: my-solution/Dockerfile
+    image: docker.io/marcuspmd/rinha-backend-2026-rust:latest
+    container_name: api1
+    volumes:
+      - sock-dir:/run/sock
+    environment:
+      - SOCKET_PATH=/run/sock/api1.sock
+      - WORKERS=1
+      - NPROBE=512
+    deploy:
+      resources:
+        limits:
+          cpus: "0.45"
+          memory: "160MB"
+    networks:
+      - rinha-net
+
+  api2:
+    build:
+      context: .
+      dockerfile: my-solution/Dockerfile
+    image: docker.io/marcuspmd/rinha-backend-2026-rust:latest
+    container_name: api2
+    volumes:
+      - sock-dir:/run/sock
+    environment:
+      - SOCKET_PATH=/run/sock/api2.sock
+      - WORKERS=1
+      - NPROBE=512
+    deploy:
+      resources:
+        limits:
+          cpus: "0.45"
+          memory: "160MB"
+    networks:
+      - rinha-net
+
+  k6:
+    image: grafana/k6:latest
+    container_name: k6
+    environment:
+      - K6_NO_USAGE_REPORT=true
+      - BASE_URL=http://haproxy:9999
+    volumes:
+      - .:/test
+    working_dir: /test
+    command: run /test/test/test-local.js
+    networks:
+      - rinha-net
+    depends_on:
+      haproxy:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: "2G"
+
+volumes:
+  sock-dir:
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+
+networks:
+  rinha-net:
+    driver: bridge

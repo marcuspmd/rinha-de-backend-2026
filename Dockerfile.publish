@@ -1,0 +1,10 @@
+FROM scratch
+
+COPY my-solution/target/x86_64-unknown-linux-musl/release/api /app/api
+COPY my-solution/index.bin /app/index.bin
+COPY resources/mcc_risk.json /app/resources/mcc_risk.json
+
+EXPOSE 8080
+
+WORKDIR /app
+CMD ["/app/api"]
