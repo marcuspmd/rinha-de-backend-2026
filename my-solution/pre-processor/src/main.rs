@@ -219,18 +219,27 @@ fn main() {
         };
     }
 
-    // 5. Escrever arquivo binário index.bin
+    // 5. Quantizar vetores f32 -> i8 (escala 127, range [-1,1] -> [-127,127])
+    let ordered_features_i8: Vec<[i8; 16]> = ordered_features.iter().map(|v| {
+        let mut out = [0i8; 16];
+        for j in 0..16 {
+            out[j] = (v[j] * 127.0).round().clamp(-127.0, 127.0) as i8;
+        }
+        out
+    }).collect();
+
+    // 6. Escrever arquivo binário index.bin (formato IVFI = IVF Int8)
     let output_path = "my-solution/index.bin";
-    println!("Escrevendo índice binário para {}...", output_path);
+    println!("Escrevendo índice binário (IVFI/i8) para {}...", output_path);
     let mut out_file = File::create(output_path).expect("Falha ao criar index.bin");
 
     // Header (16 bytes)
-    out_file.write_all(b"IVFF").unwrap();
+    out_file.write_all(b"IVFI").unwrap();
     out_file.write_all(&(K as u32).to_le_bytes()).unwrap();
     out_file.write_all(&(n_vectors as u32).to_le_bytes()).unwrap();
     out_file.write_all(&[0u8; 4]).unwrap(); // Padding para 16 bytes
 
-    // Centroids (K * 64 bytes)
+    // Centroids (K * 64 bytes, f32)
     let centroids_bytes = unsafe {
         std::slice::from_raw_parts(
             centroids.as_ptr() as *const u8,
@@ -239,7 +248,7 @@ fn main() {
     };
     out_file.write_all(centroids_bytes).unwrap();
 
-    // Cluster Metadata (K * 8 bytes)
+    // Cluster Metadata (K * 12 bytes)
     let metadata_bytes = unsafe {
         std::slice::from_raw_parts(
             cluster_metadata.as_ptr() as *const u8,
@@ -248,19 +257,19 @@ fn main() {
     };
     out_file.write_all(metadata_bytes).unwrap();
 
-    // Vectors Features (N * 64 bytes)
-    let features_bytes = unsafe {
+    // Vectors (N * 16 bytes, i8)
+    let features_i8_bytes = unsafe {
         std::slice::from_raw_parts(
-            ordered_features.as_ptr() as *const u8,
-            n_vectors * std::mem::size_of::<[f32; 16]>(),
+            ordered_features_i8.as_ptr() as *const u8,
+            n_vectors * std::mem::size_of::<[i8; 16]>(),
         )
     };
-    out_file.write_all(features_bytes).unwrap();
+    out_file.write_all(features_i8_bytes).unwrap();
 
     // Labels (N * 1 byte)
     out_file.write_all(&ordered_labels).unwrap();
 
-    // Distances (N * 4 bytes)
+    // Distances (N * 4 bytes, f32)
     let distances_bytes = unsafe {
         std::slice::from_raw_parts(
             ordered_distances.as_ptr() as *const u8,
@@ -269,5 +278,5 @@ fn main() {
     };
     out_file.write_all(distances_bytes).unwrap();
 
-    println!("Gravação concluída com sucesso! index.bin pronto.");
+    println!("Gravação concluída! index.bin (IVFI) pronto.");
 }

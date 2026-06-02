@@ -31,8 +31,8 @@ services:
       - sock-dir:/run/sock
     environment:
       - SOCKET_PATH=/run/sock/api1.sock
-      - WORKERS=1
-      - NPROBE=512
+      - WORKERS=2
+      - NPROBE=64
     deploy:
       resources:
         limits:
@@ -52,8 +52,8 @@ services:
       - sock-dir:/run/sock
     environment:
       - SOCKET_PATH=/run/sock/api2.sock
-      - WORKERS=1
-      - NPROBE=512
+      - WORKERS=2
+      - NPROBE=64
     deploy:
       resources:
         limits:

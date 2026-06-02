@@ -57,7 +57,7 @@ struct IVFIndex {
     n_vectors: usize,
     centroids: &'static [[f32; 16]],
     cluster_metadata: &'static [ClusterInfo],
-    vectors: &'static [[f32; 16]],
+    vectors: &'static [[i8; 16]],
     labels: &'static [u8],
     distances: &'static [f32],
 }
@@ -68,7 +68,7 @@ impl IVFIndex {
         let mmap = unsafe { memmap2::Mmap::map(&file).expect("Falha ao mapear index.bin") };
 
         let magic = &mmap[0..4];
-        assert_eq!(magic, b"IVFF");
+        assert_eq!(magic, b"IVFI", "Expected IVFI (int8) index format");
 
         let k_clusters = u32::from_le_bytes(mmap[4..8].try_into().unwrap()) as usize;
         let n_vectors = u32::from_le_bytes(mmap[8..12].try_into().unwrap()) as usize;
@@ -80,7 +80,7 @@ impl IVFIndex {
         let metadata_len = k_clusters * std::mem::size_of::<ClusterInfo>();
 
         let vectors_offset = metadata_offset + metadata_len;
-        let vectors_len = n_vectors * std::mem::size_of::<[f32; 16]>();
+        let vectors_len = n_vectors * std::mem::size_of::<[i8; 16]>();
 
         let labels_offset = vectors_offset + vectors_len;
         let labels_len = n_vectors;
@@ -104,9 +104,9 @@ impl IVFIndex {
             )
         };
 
-        let f32_vectors = unsafe {
+        let i8_vectors = unsafe {
             std::slice::from_raw_parts(
-                mmap.as_ptr().add(vectors_offset) as *const [f32; 16],
+                mmap.as_ptr().add(vectors_offset) as *const [i8; 16],
                 n_vectors,
             )
         };
@@ -127,18 +127,18 @@ impl IVFIndex {
 
         let centroids = unsafe { std::mem::transmute::<&[[f32; 16]], &'static [[f32; 16]]>(centroids) };
         let cluster_metadata = unsafe { std::mem::transmute::<&[ClusterInfo], &'static [ClusterInfo]>(cluster_metadata) };
-        let f32_vectors = unsafe { std::mem::transmute::<&[[f32; 16]], &'static [[f32; 16]]>(f32_vectors) };
+        let i8_vectors = unsafe { std::mem::transmute::<&[[i8; 16]], &'static [[i8; 16]]>(i8_vectors) };
         let labels = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(labels) };
         let distances = unsafe { std::mem::transmute::<&[f32], &'static [f32]>(distances) };
 
-        // Pretouch mmap to prevent page faults during benchmark
+        // Pretouch mmap: index is only 60MB, fits in 160MB container
         let page_size = 4096;
         let mut dummy = 0u8;
         for offset in (0..mmap.len()).step_by(page_size) {
             dummy ^= mmap[offset];
         }
-        println!("Mmap pretouch complete, dummy value = {}", dummy);
-        println!("Index loaded: {} vectors mapped as f32 directly", n_vectors);
+        println!("Mmap pretouch complete ({}MB), dummy={}", mmap.len() / 1024 / 1024, dummy);
+        println!("Index loaded: {} vectors as i8 ({}MB)", n_vectors, mmap.len() / 1024 / 1024);
 
         Self {
             _mmap: mmap,
@@ -146,7 +146,7 @@ impl IVFIndex {
             n_vectors,
             centroids,
             cluster_metadata,
-            vectors: f32_vectors,
+            vectors: i8_vectors,
             labels,
             distances,
         }
@@ -310,6 +310,74 @@ fn squared_distance_fallback(a: &[f32; 16], b: &[f32; 16]) -> f32 {
     let mut sum = 0.0f32;
     for i in 0..16 {
         let diff = a[i] - b[i];
+        sum += diff * diff;
+    }
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn squared_distance_i8_preloaded(vq0: std::arch::x86_64::__m256, vq1: std::arch::x86_64::__m256, b: &[i8; 16]) -> f32 {
+    use std::arch::x86_64::*;
+    // Load 16 i8s, sign-extend to i16 (256-bit with 16 × i16)
+    let vi128 = _mm_loadu_si128(b.as_ptr() as *const __m128i);
+    let vi16 = _mm256_cvtepi8_epi16(vi128);
+    // Split into low/high 8 × i16, widen to i32, convert to f32
+    let lo = _mm256_extracti128_si256(vi16, 0);
+    let hi = _mm256_extracti128_si256(vi16, 1);
+    let scale = _mm256_set1_ps(1.0f32 / 127.0);
+    let vb0 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(lo)), scale);
+    let vb1 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(hi)), scale);
+    let diff0 = _mm256_sub_ps(vq0, vb0);
+    let diff1 = _mm256_sub_ps(vq1, vb1);
+    let sq0 = _mm256_mul_ps(diff0, diff0);
+    let sq1 = _mm256_mul_ps(diff1, diff1);
+    let sum = _mm256_add_ps(sq0, sq1);
+    let low128 = _mm256_castps256_ps128(sum);
+    let high128 = _mm256_extractf128_ps(sum, 1);
+    let sum128 = _mm_add_ps(low128, high128);
+    let shuf = _mm_movehdup_ps(sum128);
+    let sum128 = _mm_add_ps(sum128, shuf);
+    let shuf = _mm_movehl_ps(shuf, sum128);
+    let sum128 = _mm_add_ps(sum128, shuf);
+    _mm_cvtss_f32(sum128)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn squared_distance_i8_preloaded(
+    vq0: std::arch::aarch64::float32x4_t,
+    vq1: std::arch::aarch64::float32x4_t,
+    vq2: std::arch::aarch64::float32x4_t,
+    vq3: std::arch::aarch64::float32x4_t,
+    b: &[i8; 16],
+) -> f32 {
+    use std::arch::aarch64::*;
+    let vi8 = vld1q_s8(b.as_ptr());
+    let scale = vdupq_n_f32(1.0f32 / 127.0);
+    let lo_i16 = vmovl_s8(vget_low_s8(vi8));
+    let hi_i16 = vmovl_s8(vget_high_s8(vi8));
+    let vb0 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo_i16))), scale);
+    let vb1 = vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(lo_i16)), scale);
+    let vb2 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi_i16))), scale);
+    let vb3 = vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(hi_i16)), scale);
+    let diff0 = vsubq_f32(vq0, vb0);
+    let diff1 = vsubq_f32(vq1, vb1);
+    let diff2 = vsubq_f32(vq2, vb2);
+    let diff3 = vsubq_f32(vq3, vb3);
+    let mut sum = vmulq_f32(diff0, diff0);
+    sum = vfmaq_f32(sum, diff1, diff1);
+    sum = vfmaq_f32(sum, diff2, diff2);
+    sum = vfmaq_f32(sum, diff3, diff3);
+    vaddvq_f32(sum)
+}
+
+#[inline(always)]
+fn squared_distance_i8_fallback(q: &[f32; 16], b: &[i8; 16]) -> f32 {
+    let scale = 1.0f32 / 127.0;
+    let mut sum = 0.0f32;
+    for i in 0..16 {
+        let diff = q[i] - b[i] as f32 * scale;
         sum += diff * diff;
     }
     sum
@@ -642,7 +710,7 @@ fn handle_connection<S: Read + Write>(
                             if (dist_v_c - dist_q_c).abs() >= threshold_top5_f32 + 0.0002 {
                                 continue;
                             }
-                            let dist_sq = squared_distance_preloaded(vq0, vq1, &state.index.vectors[idx]);
+                            let dist_sq = squared_distance_i8_preloaded(vq0, vq1, &state.index.vectors[idx]);
                             if dist_sq < threshold_top5 {
                                 top5[4] = (dist_sq, state.index.labels[idx]);
                                 let mut x = 4;
@@ -662,7 +730,7 @@ fn handle_connection<S: Read + Write>(
                             if (dist_v_c - dist_q_c).abs() >= threshold_top5_f32 + 0.0002 {
                                 continue;
                             }
-                            let dist_sq = squared_distance_preloaded(vq0, vq1, vq2, vq3, &state.index.vectors[idx]);
+                            let dist_sq = squared_distance_i8_preloaded(vq0, vq1, vq2, vq3, &state.index.vectors[idx]);
                             if dist_sq < threshold_top5 {
                                 top5[4] = (dist_sq, state.index.labels[idx]);
                                 let mut x = 4;
@@ -681,7 +749,7 @@ fn handle_connection<S: Read + Write>(
                         if (dist_v_c - dist_q_c).abs() >= threshold_top5_f32 + 0.0002 {
                             continue;
                         }
-                        let dist_sq = squared_distance_fallback(&q, &state.index.vectors[idx]);
+                        let dist_sq = squared_distance_i8_fallback(&q, &state.index.vectors[idx]);
                         if dist_sq < threshold_top5 {
                             top5[4] = (dist_sq, state.index.labels[idx]);
                             let mut x = 4;
@@ -880,7 +948,7 @@ fn run_warmup(state: &Arc<AppState>) {
                     if (dist_v_c - dist_q_c).abs() >= threshold_top5_f32 + 0.0002 {
                         continue;
                     }
-                    let dist_sq = squared_distance_preloaded(vq0, vq1, &state.index.vectors[idx]);
+                    let dist_sq = squared_distance_i8_preloaded(vq0, vq1, &state.index.vectors[idx]);
                     if dist_sq < threshold_top5 {
                         top5[4] = (dist_sq, state.index.labels[idx]);
                         let mut x = 4;
@@ -900,7 +968,7 @@ fn run_warmup(state: &Arc<AppState>) {
                     if (dist_v_c - dist_q_c).abs() >= threshold_top5_f32 + 0.0002 {
                         continue;
                     }
-                    let dist_sq = squared_distance_preloaded(vq0, vq1, vq2, vq3, &state.index.vectors[idx]);
+                    let dist_sq = squared_distance_i8_preloaded(vq0, vq1, vq2, vq3, &state.index.vectors[idx]);
                     if dist_sq < threshold_top5 {
                         top5[4] = (dist_sq, state.index.labels[idx]);
                         let mut x = 4;
@@ -919,7 +987,7 @@ fn run_warmup(state: &Arc<AppState>) {
                 if (dist_v_c - dist_q_c).abs() >= threshold_top5_f32 + 0.0002 {
                     continue;
                 }
-                let dist_sq = squared_distance_fallback(&q, &state.index.vectors[idx]);
+                let dist_sq = squared_distance_i8_fallback(&q, &state.index.vectors[idx]);
                 if dist_sq < threshold_top5 {
                     top5[4] = (dist_sq, state.index.labels[idx]);
                     let mut x = 4;
